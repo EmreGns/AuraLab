@@ -1,0 +1,1 @@
+"""Desktop Auto EQ application package."""
