@@ -1,10 +1,10 @@
 @echo off
-title Auto EQ Desktop
+title AuraLab Desktop
 setlocal
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
-    echo [ERROR] Auto EQ Python sanal ortami (.venv) bulunamadi!
+    echo [ERROR] AuraLab Python sanal ortami .venv bulunamadi!
     echo Lutfen once asagidaki komutlari calistirin:
     echo   python -m venv .venv
     echo   .venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -13,6 +13,6 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-echo Auto EQ Baslatiliyor...
+echo AuraLab Baslatiliyor...
 "%~dp0.venv\Scripts\python.exe" -m auto_eq
 endlocal

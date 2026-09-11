@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import atexit
 import json
+import threading
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
+import comtypes
 from pycaw.constants import ERole
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
@@ -35,6 +39,8 @@ class SystemAudioManager:
         self._original: WindowsAudioState | None = None
         self._managed_ids: list[str] = []
         self._output_cache = None
+        self._restored = False
+        atexit.register(self.restore)
         self._restore_recovery()
 
     @staticmethod
@@ -55,6 +61,29 @@ class SystemAudioManager:
                 return device
         raise RuntimeError("VB-CABLE CABLE Input output cihazı bulunamadı.")
 
+    def find_preferred_physical_speaker(self):
+        """Öncelikle C-Media cihazını, yoksa ilk gerçek fiziksel hoparlörü döndür."""
+        devices = self._all_output_devices()
+        # 1. C-Media öncelikli
+        for device in devices:
+            name = device.FriendlyName.casefold()
+            if "c-media" in name or "cmedia" in name or "c media" in name:
+                return device
+
+        # 2. Virtual/Cable/Steam olmayan ilk fiziksel hoparlör
+        for device in devices:
+            name = device.FriendlyName.casefold()
+            if not any(v in name for v in ("cable", "virtual", "steam", "loopback", "voice")):
+                return device
+
+        # 3. Cable olmayan herhangi biri
+        for device in devices:
+            name = device.FriendlyName.casefold()
+            if "cable" not in name:
+                return device
+
+        return None
+
     def _find_by_id(self, device_id: str):
         return next((device for device in self._all_output_devices() if device.id == device_id), None)
 
@@ -64,6 +93,14 @@ class SystemAudioManager:
 
     def _read_state(self) -> WindowsAudioState:
         device = self._default_device()
+        # Eğer varsayılan aygıt şu anda zaten Cable veya sanal bir aygıtsa,
+        # asla Cable'ı orijinal olarak kaydetme! Fiziksel hoparlörü bul.
+        name_lower = device.FriendlyName.casefold()
+        if "cable" in name_lower or "virtual" in name_lower:
+            phys = self.find_preferred_physical_speaker()
+            if phys is not None:
+                device = phys
+
         endpoint = self._endpoint_volume(device)
         return WindowsAudioState(
             default_device_id=device.id,
@@ -85,30 +122,75 @@ class SystemAudioManager:
             return
         try:
             state = json.loads(self._state_path.read_text(encoding="utf-8"))
-            self.set_default_device(state["default_device_id"])
-            device = self._find_by_id(state["default_device_id"])
-            if device is not None:
-                device.EndpointVolume.SetMasterVolumeLevelScalar(float(state["volume"]), None)
-                device.EndpointVolume.SetMute(bool(state["muted"]), None)
+            dev_id = state.get("default_device_id")
+            name = state.get("default_device_name", "").casefold()
+            # Eğer kurtarma dosyasında yanlışlıkla cable varsa düzelt
+            if "cable" in name or "virtual" in name:
+                phys = self.find_preferred_physical_speaker()
+                if phys is not None:
+                    dev_id = phys.id
+            if dev_id:
+                self.set_default_device(dev_id)
+                device = self._find_by_id(dev_id)
+                if device is not None:
+                    vol = float(state.get("volume", 0.5))
+                    muted = bool(state.get("muted", False))
+                    device.EndpointVolume.SetMasterVolumeLevelScalar(vol, None)
+                    device.EndpointVolume.SetMute(muted, None)
             self._state_path.unlink(missing_ok=True)
         except Exception:
             pass
 
     def begin(self) -> WindowsAudioState:
         with self._lock:
+            self._restored = False
             self._original = self._read_state()
             self._write_recovery()
             cable = self._find_cable()
             self.set_default_device(cable.id)
             self._managed_ids = [cable.id]
+            # Kullanıcının mevcut Windows ses seviyesini anında uygula (geçiş sesi saklamasın)
             self.set_master(self._original.volume, self._original.muted)
-            return self._original
+
+        # Fiziksel hoparlörün donanım kanalını %100'e aç — 1 saniyelik gecikmeyle
+        # (kullanıcı Windows ses kaydırıcısının anlık sıçramasını görmemelidir)
+        threading.Thread(
+            target=self._maximize_delayed,
+            name="auralab-maximize-vol",
+            daemon=True,
+        ).start()
+
+        return self._original
+
+    def _maximize_delayed(self) -> None:
+        """Arka planda 1 saniye bekleyip fiziksel cihaz sesini %100'e çek."""
+        time.sleep(1.0)
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        try:
+            self.maximize_physical_device_volume()
+        except Exception:
+            pass
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
 
     def set_default_device(self, device_id: str) -> None:
-        AudioUtilities.SetDefaultDevice(
-            device_id,
-            roles=[ERole.eConsole, ERole.eMultimedia, ERole.eCommunications],
-        )
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        try:
+            AudioUtilities.SetDefaultDevice(
+                device_id,
+                roles=[ERole.eConsole, ERole.eMultimedia, ERole.eCommunications],
+            )
+        except Exception:
+            pass
 
     def _managed_endpoints(self):
         endpoints = []
@@ -116,64 +198,150 @@ class SystemAudioManager:
             try:
                 device = next(device for device in self._all_output_devices() if device.id == device_id)
                 endpoints.append(self._endpoint_volume(device))
-            except StopIteration:
+            except Exception:
                 pass
         return endpoints
 
     def set_master(self, volume: float, muted: bool) -> None:
         value = max(0.0, min(1.0, float(volume)))
         for endpoint in self._managed_endpoints():
-            endpoint.SetMasterVolumeLevelScalar(value, None)
-            endpoint.SetMute(bool(muted), None)
+            try:
+                endpoint.SetMasterVolumeLevelScalar(value, None)
+                endpoint.SetMute(bool(muted), None)
+            except Exception:
+                pass
         if self._managed_ids:
             try:
                 current = self._default_device()
                 endpoint = self._endpoint_volume(current)
                 endpoint.SetMasterVolumeLevelScalar(value, None)
                 endpoint.SetMute(bool(muted), None)
-            except (OSError, RuntimeError):
+            except Exception:
                 pass
 
     def current_master(self) -> tuple[float, bool]:
-        device = self._default_device()
-        endpoint = self._endpoint_volume(device)
-        return float(endpoint.GetMasterVolumeLevelScalar()), bool(endpoint.GetMute())
+        try:
+            device = self._default_device()
+            endpoint = self._endpoint_volume(device)
+            return float(endpoint.GetMasterVolumeLevelScalar()), bool(endpoint.GetMute())
+        except Exception:
+            return 0.5, False
 
     def sync_to_physical(self, device_id: str) -> None:
         if device_id not in self._managed_ids:
             self._managed_ids.append(device_id)
-        volume, muted = self.current_master()
         try:
-            device = next(device for device in self._all_output_devices() if device.id == device_id)
-            endpoint = self._endpoint_volume(device)
-            endpoint.SetMasterVolumeLevelScalar(volume, None)
-            endpoint.SetMute(muted, None)
-        except StopIteration:
-            raise RuntimeError("Seçilen fiziksel output Windows endpoint listesinde yok.")
+            volume, muted = self.current_master()
+            device = next((device for device in self._all_output_devices() if device.id == device_id or device.FriendlyName == device_id), None)
+            if device is not None:
+                endpoint = self._endpoint_volume(device)
+                endpoint.SetMasterVolumeLevelScalar(volume, None)
+                endpoint.SetMute(muted, None)
+        except Exception:
+            pass
+
+    def maximize_physical_device_volume(self, device_name_or_id: str | None = None) -> None:
+        """Fiziksel çıkış cihazlarının (örn. 24G4HRE, C-Media) Windows donanım sesini %100'e (1.0)
+        alarak hoparlörlerin tam güçlerini kullanmasını sağlar."""
+        try:
+            for device in self._all_output_devices():
+                try:
+                    name = getattr(device, "FriendlyName", "") or ""
+                    dev_id = getattr(device, "id", "") or ""
+                    if any(v in name.casefold() for v in ("cable", "virtual", "steam", "line")):
+                        continue
+                    if device_name_or_id:
+                        query = device_name_or_id.casefold().strip()
+                        if query not in name.casefold() and query != dev_id:
+                            continue
+                    ep = self._endpoint_volume(device)
+                    ep.SetMasterVolumeLevelScalar(1.0, None)
+                    ep.SetMute(False, None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def sync_to_physical_id(self, device_id: str) -> None:
-        device = next((item for item in self._all_output_devices() if item.id == device_id), None)
-        if device is None:
-            raise RuntimeError("Seçilen fiziksel output Windows endpoint listesinde yok.")
-        if device_id not in self._managed_ids:
-            self._managed_ids.append(device_id)
-        volume, muted = self.current_master()
-        device.EndpointVolume.SetMasterVolumeLevelScalar(volume, None)
-        device.EndpointVolume.SetMute(muted, None)
+        try:
+            device = next((item for item in self._all_output_devices() if item.id == device_id), None)
+            if device is None:
+                return
+            if device_id not in self._managed_ids:
+                self._managed_ids.append(device_id)
+            volume, muted = self.current_master()
+            device.EndpointVolume.SetMasterVolumeLevelScalar(volume, None)
+            device.EndpointVolume.SetMute(muted, None)
+        except Exception:
+            pass
 
     def restore(self) -> None:
         with self._lock:
-            if self._original is None:
+            if self._restored:
                 return
-            original = self._original
-            try:
-                self.set_default_device(original.default_device_id)
-                device = self._default_device()
-                endpoint = self._endpoint_volume(device)
-                endpoint.SetMasterVolumeLevelScalar(original.volume, None)
-                endpoint.SetMute(original.muted, None)
-                self._state_path.unlink(missing_ok=True)
-                self._original = None
-            except (OSError, RuntimeError):
-                self._write_recovery()
-                raise
+            target_id = None
+            vol = 0.5
+            muted = False
+            if self._original is not None:
+                orig_name = self._original.default_device_name.casefold()
+                if "cable" not in orig_name and "virtual" not in orig_name:
+                    target_id = self._original.default_device_id
+                    vol = self._original.volume
+                    muted = self._original.muted
+
+            # Eğer original yoksa veya Cable ise, fiziksel hoparlöre dön (C-Media vb.)
+            if target_id is None:
+                phys = self.find_preferred_physical_speaker()
+                if phys is not None:
+                    target_id = phys.id
+
+            if target_id:
+                try:
+                    self.set_default_device(target_id)
+                    device = self._find_by_id(target_id)
+                    if device is not None:
+                        endpoint = self._endpoint_volume(device)
+                        endpoint.SetMasterVolumeLevelScalar(vol, None)
+                        endpoint.SetMute(muted, None)
+                    self._state_path.unlink(missing_ok=True)
+                    self._original = None
+                    self._restored = True
+                except (OSError, RuntimeError):
+                    self._write_recovery()
+                    raise
+
+    def is_cable_default(self) -> bool:
+        """Varsayılan çıkışın VB-CABLE olup olmadığını kontrol et."""
+        try:
+            device = self._default_device()
+            return "cable input" in device.FriendlyName.casefold()
+        except Exception:
+            return False
+
+    def switch_to_cable(self) -> str:
+        """Windows varsayılan ses çıkışını VB-CABLE Input yaparak AutoEQ'yu aktif et."""
+        cable = self._find_cable()
+        self.set_default_device(cable.id)
+        if cable.id not in self._managed_ids:
+            self._managed_ids.append(cable.id)
+        self._restored = False
+        return cable.FriendlyName
+
+    def switch_to_speaker(self) -> str:
+        """Windows varsayılan ses çıkışını doğrudan fiziksel hoparlöre (C-Media) aktar."""
+        phys = self.find_preferred_physical_speaker()
+        if phys is None:
+            raise RuntimeError("Fiziksel hoparlör bulunamadı.")
+        self.set_default_device(phys.id)
+        return phys.FriendlyName
+
+    def toggle_routing(self) -> tuple[bool, str]:
+        """Cable ile fiziksel hoparlör arasında geçiş yap. (is_cable, device_name) döndürür."""
+        with self._lock:
+            if self.is_cable_default():
+                name = self.switch_to_speaker()
+                return False, name
+            else:
+                name = self.switch_to_cable()
+                return True, name
+

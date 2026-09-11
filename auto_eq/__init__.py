@@ -1,1 +1,1 @@
-"""Desktop Auto EQ application package."""
+"""Desktop AuraLab application package."""
